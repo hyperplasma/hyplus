@@ -1,7 +1,7 @@
 {
   "site": {
-    "title": "plain \u2014 sample site",
-    "url": "https://plain-cms.github.io/plain",
+    "title": "Hyplus \u2014 sample site",
+    "url": "https://hyperplasma.github.io/hyplus",
     "description": "The sample site that ships with plain, the Git-native CMS.",
     "language": "en",
     "theme": "default",
