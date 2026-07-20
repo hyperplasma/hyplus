@@ -3,12 +3,13 @@
 // content metadata; writes through the GitHub API (see github.js).
 // UI language rule: never "commit/push/branch" — always "save/publish/history".
 
-import { auth, repoInfo, getFile, putFile, listDir, commitsFor, runFor, dispatchWorkflow, cmpVersion } from './github.js';
+import { auth, repoInfo, getFile, updateFile, listDir, commitsFor, runFor, dispatchWorkflow, cmpVersion } from './github.js';
 import { h, show, toast, timeAgo, watchBuild, ask } from './ui.js';
 import { editorScreen } from './editor.js';
 import { mediaScreen } from './media.js';
 import { aiSettings } from './ai.js';
 import { appearanceScreen } from './appearance.js';
+import { pluginsScreen } from './plugins.js';
 import { wizardScreen } from './wizard.js';
 
 let siteInfo = null;             // parsed /api/site.json (schema + site block)
@@ -40,6 +41,7 @@ function shell(active, ...content) {
       link('#/media', 'Media', 'media'),
       link('#/navigation', 'Navigation', 'navigation'),
       link('#/appearance', 'Appearance', 'appearance'),
+      link('#/plugins', 'Plugins', 'plugins'),
       link('#/settings', 'Settings', 'settings'),
       h('div', { class: 'sidebar-foot' },
         h('a', { href: siteInfo?.site.url || '/', target: '_blank', rel: 'noopener' }, 'View site ↗'),
@@ -229,9 +231,8 @@ async function collectionScreen(name) {
 }
 
 async function navigationScreen() {
-  let sha = null;
   let entries = siteInfo?.navigation || [];
-  try { const file = await getFile('data/navigation.json'); entries = JSON.parse(file.text); sha = file.sha; } catch { /* file may not exist yet — start empty */ }
+  try { const file = await getFile('data/navigation.json'); entries = JSON.parse(file.text); } catch { /* file may not exist yet — start empty */ }
 
   const list = h('div', { class: 'nav-rows' });
   const rowFor = (entry) => {
@@ -249,10 +250,10 @@ async function navigationScreen() {
     const next = [...list.children].map((row) => ({ label: row.children[0].value.trim(), url: row.children[1].value.trim() }))
       .filter((e) => e.label && e.url);
     try {
-      const { commitSha } = await putFile('data/navigation.json', JSON.stringify(next, null, 2) + '\n', 'navigation: update menu', sha);
+      const { commitSha } = await updateFile('data/navigation.json', () => JSON.stringify(next, null, 2) + '\n', 'navigation: update menu');
       checklistState.set({ menu: true });
       toast('Menu saved — publishing now.', 'success');
-      watchBuild(commitSha, siteInfo?.site.url);
+      if (commitSha) watchBuild(commitSha, siteInfo?.site.url);
       route();
     } catch (error) { toast(error.message, 'error'); }
   }
@@ -266,7 +267,7 @@ async function navigationScreen() {
 }
 
 async function settingsScreen() {
-  const { text, sha } = await getFile('site.config.json');
+  const { text } = await getFile('site.config.json');
   const config = JSON.parse(text);
   const themes = (await listDir('themes')).filter((e) => e.type === 'dir').map((e) => e.name);
   const field = (label, input) => h('label', { class: 'field' }, label, input);
@@ -274,6 +275,7 @@ async function settingsScreen() {
   const description = h('input', { type: 'text', value: config.site.description || '' });
   const url = h('input', { type: 'text', value: config.site.url });
   const language = h('input', { type: 'text', value: config.site.language || 'en' });
+  const languages = h('input', { type: 'text', value: (config.site.languages || []).filter((l) => l !== (config.site.language || 'en')).join(' '), placeholder: 'de fr' });
   const theme = h('select', {}, themes.map((name) => h('option', { value: name, selected: name === config.site.theme ? '' : null }, name)));
   const footerFile = await getFile('data/footer.json').catch(() => ({ text: '{}', sha: undefined })); // may not exist yet
   const footer = h('input', { type: 'text', value: JSON.parse(footerFile.text).html || '', placeholder: 'Powered by <a href="…">…</a>' });
@@ -284,13 +286,26 @@ async function settingsScreen() {
   async function save() {
     aiSettings.key = aiKey.value.trim();      // stays on this device — never committed
     aiSettings.model = aiModel.value;
-    Object.assign(config.site, { title: title.value.trim(), description: description.value.trim(),
-      url: url.value.trim().replace(/\/$/, ''), language: language.value.trim() || 'en', theme: theme.value });
+    const defaultLang = language.value.trim() || 'en';
+    const extra = [...new Set(languages.value.trim().split(/[\s,]+/).map((c) => c.toLowerCase()).filter(Boolean))].filter((c) => c !== defaultLang);
+    const siteUrl = url.value.trim().replace(/\/$/, '');
+    const wantedFooter = footer.value.trim();
     try {
-      if (footer.value.trim() !== (JSON.parse(footerFile.text).html || '')) await putFile('data/footer.json', JSON.stringify({ html: footer.value.trim() }, null, 2) + '\n', 'settings: update footer', footerFile.sha);
-      const { commitSha } = await putFile('site.config.json', JSON.stringify(config, null, 2) + '\n', 'settings: update site settings', sha);
+      // Re-read + re-apply on each write, so enabling a plugin (or any other edit)
+      // between opening Settings and saving is preserved here, never clobbered.
+      const foot = await updateFile('data/footer.json', (text) =>
+        wantedFooter === (JSON.parse(text || '{}').html || '') ? text : JSON.stringify({ html: wantedFooter }, null, 2) + '\n',
+        'settings: update footer');
+      const { commitSha } = await updateFile('site.config.json', (text) => {
+        const cfg = JSON.parse(text);
+        Object.assign(cfg.site, { title: title.value.trim(), description: description.value.trim(),
+          url: siteUrl, language: defaultLang, theme: theme.value,
+          languages: extra.length ? [defaultLang, ...extra] : [] });
+        return JSON.stringify(cfg, null, 2) + '\n';
+      }, 'settings: update site settings');
       toast('Settings saved — publishing now.', 'success');
-      watchBuild(commitSha, config.site.url);
+      const built = commitSha || foot.commitSha;
+      if (built) watchBuild(built, siteUrl);
     } catch (error) { toast(error.message, 'error'); }
   }
 
@@ -302,8 +317,10 @@ async function settingsScreen() {
       field('One-line description', description),
       field('Site address (URL)', url),
       field('Language code', language),
+      field('Additional languages', languages),
       field('Theme', theme),
       field('Footer note (HTML, shown on every page)', footer)),
+    h('p', { class: 'muted' }, 'Add “Additional languages” (codes like de fr) to make the site multilingual: translations live in sibling files (about.de.md), the editor’s Translate button writes them, and the language-switcher plugin shows a footer switcher.'),
     h('hr'),
     h('h2', {}, 'AI assist'),
     h('p', { class: 'muted' }, 'Optional. Paste an Anthropic API key to enable the ✨ buttons in the editor. The key stays in this browser and is sent only to Anthropic.'),
@@ -323,6 +340,7 @@ const routes = {
   media: async () => shell('media', await mediaScreen()),
   navigation: navigationScreen,
   appearance: async () => shell('appearance', await appearanceScreen(siteInfo)),
+  plugins: async () => shell('plugins', await pluginsScreen(siteInfo)),
   settings: settingsScreen,
   welcome: () => wizardScreen(siteInfo, () => { location.hash = '#/'; route(); }),
 };
